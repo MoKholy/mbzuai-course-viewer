@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Course Schedule Viewer</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Course Schedule Viewer</h1>
+        <p id="termLabel">Load a graduate class schedule PDF to begin.</p>
+      </div>
+      <label class="file-control">
+        <span>Load PDF</span>
+        <input id="pdfInput" type="file" accept="application/pdf">
+      </label>
+    </header>
+
+    <main class="layout">
+      <aside class="sidebar">
+        <section class="panel">
+          <h2>Catalog</h2>
+          <div class="filters">
+            <input id="searchInput" type="search" placeholder="Search code, title, instructor">
+            <select id="programFilter">
+              <option value="all">All programs</option>
+            </select>
+            <select id="levelFilter">
+              <option value="all">All levels</option>
+              <option value="masters">Master's level</option>
+              <option value="phd">PhD level</option>
+            </select>
+          </div>
+          <div id="stats" class="stats">No courses loaded.</div>
+          <div id="catalog" class="catalog empty">Choose a PDF file.</div>
+        </section>
+      </aside>
+
+      <section class="workspace">
+        <nav class="tabs" aria-label="Views">
+          <button class="tab active" data-view="schedule">Schedule</button>
+          <button class="tab" data-view="saved">Saved</button>
+          <button class="tab" data-view="conflicts">Conflicts</button>
+          <button class="tab" data-view="suggest">Suggest</button>
+          <button class="tab" data-view="data">Extracted Data</button>
+        </nav>
+
+        <section id="scheduleView" class="view active">
+          <div class="section-head">
+            <div>
+              <h2>Selected Schedule</h2>
+              <p id="selectedSummary">No courses added yet.</p>
+            </div>
+            <div class="schedule-actions">
+              <div class="period-toggle" aria-label="Schedule period">
+                <button class="period-button active" data-period-view="all">All</button>
+                <button class="period-button" data-period-view="first">First 7 Weeks</button>
+                <button class="period-button" data-period-view="second">Second 7 Weeks</button>
+              </div>
+              <button id="copyCrns" class="secondary">Copy CRNs</button>
+              <button id="openSaveSchedule" class="secondary">Save</button>
+              <button id="clearSelection" class="secondary">Clear</button>
+            </div>
+          </div>
+          <div id="selectedCourses" class="selected-list"></div>
+          <div id="scheduleGrid" class="schedule-grid"></div>
+        </section>
+
+        <section id="savedView" class="view">
+          <div class="section-head">
+            <div>
+              <h2>Saved Schedules</h2>
+              <p>Name a schedule, add notes, and keep multiple options to compare.</p>
+            </div>
+          </div>
+          <div class="saved-layout">
+            <form id="saveScheduleForm" class="saved-editor">
+              <label>
+                <span>Name</span>
+                <input id="scheduleName" type="text" placeholder="e.g. NLP-heavy option">
+              </label>
+              <label>
+                <span>Notes</span>
+                <textarea id="scheduleNotes" rows="5" placeholder="Why this schedule might work, tradeoffs, commute gaps, advisor constraints..."></textarea>
+              </label>
+              <button id="saveSchedule" type="submit">Save current schedule</button>
+            </form>
+            <div>
+              <div class="folder-title">
+                <span>Saved folder</span>
+                <span id="savedCount" class="meta">0 schedules</span>
+              </div>
+              <div id="savedSchedules" class="saved-folder empty">No saved schedules yet.</div>
+            </div>
+          </div>
+        </section>
+
+        <section id="conflictsView" class="view">
+          <div class="section-head">
+            <div>
+              <h2>Conflict Viewer</h2>
+              <p>Conflicts are checked by day, clock time, and overlapping course period.</p>
+            </div>
+          </div>
+          <div id="conflictList" class="conflict-list"></div>
+        </section>
+
+        <section id="suggestView" class="view">
+          <div class="section-head">
+            <div>
+              <h2>Schedule Suggestions</h2>
+              <p>Use Must for required courses and Consider for optional courses you want if they fit.</p>
+            </div>
+            <button id="suggestButton">Suggest schedules</button>
+          </div>
+          <div id="desiredList" class="desired-list"></div>
+          <div id="suggestions" class="suggestions"></div>
+          <div class="suggestion-history-head">
+            <h3>Suggestion History</h3>
+            <button id="clearSuggestionHistory" class="secondary">Clear history</button>
+          </div>
+          <div id="suggestionHistory" class="suggestion-history empty">No suggestion history yet.</div>
+        </section>
+
+        <section id="dataView" class="view">
+          <div class="section-head">
+            <div>
+              <h2>Extracted Data</h2>
+              <p>Raw parsed meetings grouped by course section.</p>
+            </div>
+            <button id="downloadJson" class="secondary">Download JSON</button>
+          </div>
+          <pre id="dataOutput" class="data-output">No data loaded.</pre>
+        </section>
+      </section>
+    </main>
+
+    <div id="status" class="status" role="status" aria-live="polite"></div>
+    <script src="app.js"></script>
+  </body>
+</html>
