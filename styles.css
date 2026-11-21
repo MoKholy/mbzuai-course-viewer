@@ -589,6 +589,11 @@ button.danger {
   --course-border: #a7c979;
 }
 
+.program-cms {
+  --course-bg: #f3e6d8;
+  --course-border: #cfae8c;
+}
+
 .program-all {
   --course-bg: #e8ebef;
   --course-border: #b8c0ca;

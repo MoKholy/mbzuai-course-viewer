@@ -14,12 +14,19 @@ const state = {
 };
 
 const PROGRAMS = ["ML", "CV", "NLP", "CS", "ROB", "SDS", "HCI", "CBIO", "All PhD", "All"];
+// Labels as printed in the legacy (Fall 2026) PDF; used to strip the period from note text.
 const PERIODS = [
   "14 weeks",
   "First 7 Weeks (7-1)",
   "Second 7 Weeks (7-2)",
   "11 weeks",
 ];
+// Canonical period labels stored on meetings.
+const PERIOD_FULL = "14 weeks";
+const PERIOD_FIRST = "First 7 weeks";
+const PERIOD_SECOND = "Second 7 weeks";
+const PERIOD_ELEVEN = "11 weeks";
+const PERIOD_BOTH_HALVES = "First + Second 7 weeks";
 const DAYS = [
   ["M", "Monday"],
   ["T", "Tuesday"],
@@ -29,11 +36,11 @@ const DAYS = [
   ["U", "Sunday"],
 ];
 const START_HOUR = 8;
-const END_HOUR = 19;
+const END_HOUR = 20;
 const HOUR_HEIGHT = 64;
 const MIN_DAY_WIDTH = 150;
 const TIME_WIDTH = 70;
-const PARSER_VERSION = 2;
+const PARSER_VERSION = 3;
 const LAST_LOADED_JSON_KEY = "courseScheduleViewer.lastLoadedJson";
 const SAVED_SCHEDULES_KEY = "courseScheduleViewer.savedSchedules";
 const SUGGESTION_HISTORY_KEY = "courseScheduleViewer.suggestionHistory";
@@ -125,14 +132,13 @@ async function handlePdfUpload(event) {
   try {
     showStatus("Reading PDF...");
     const buffer = await file.arrayBuffer();
-    const items = await extractPdfTextItems(buffer);
-    const meetings = parseMeetings(items, file.name);
+    const { meetings, term } = await parseSchedulePdf(buffer, file.name);
 
     if (!meetings.length) {
       throw new Error("No course rows were found. This parser expects the graduate class schedule table format.");
     }
 
-    state.term = termFromFileName(file.name);
+    state.term = term;
     state.meetings = meetings;
     buildCourseIndex();
     saveLastLoadedJson(file.name);
@@ -143,6 +149,716 @@ async function handlePdfUpload(event) {
     showStatus(error.message || "Could not parse the PDF.");
   }
 }
+
+async function parseSchedulePdf(arrayBuffer, fileName) {
+  // Current layout (Spring 2027+): one row per meeting with codes like "ML7501-lec-001",
+  // separate primary/secondary instructor, level, capacity, and new/old classroom columns.
+  try {
+    const items = await extractPositionedTextItems(arrayBuffer);
+    const meetings = parseTimetableItems(items, fileName);
+    if (meetings.length) {
+      return { meetings, term: termFromItems(items) || termFromFileName(fileName) };
+    }
+  } catch (error) {
+    console.warn("Timetable layout parser failed; trying the legacy layout.", error);
+  }
+
+  // Legacy layout (Fall 2026): "ML701-001 Lecture 12345" rows with glyph+29 text encoding.
+  const legacyItems = await extractPdfTextItems(arrayBuffer);
+  return { meetings: parseMeetings(legacyItems, fileName), term: termFromFileName(fileName) };
+}
+
+/* ---------- Generic positioned text extraction (fonts with ToUnicode CMaps) ---------- */
+
+async function extractPositionedTextItems(arrayBuffer) {
+  const bytes = new Uint8Array(arrayBuffer);
+  const raw = new TextDecoder("latin1").decode(bytes);
+  const objects = readPdfObjects(raw);
+  const streamCache = new Map();
+  const fontCache = new Map();
+
+  const getStream = async (num) => {
+    if (streamCache.has(num)) return streamCache.get(num);
+    const obj = objects.get(num);
+    let text = "";
+    if (obj && obj.streamStart !== undefined) {
+      let data = trimStreamBytes(bytes.slice(obj.streamStart, obj.streamEnd));
+      if (/\/FlateDecode/.test(obj.dict)) data = await inflateBytes(data);
+      text = new TextDecoder("latin1").decode(data);
+    }
+    streamCache.set(num, text);
+    return text;
+  };
+
+  const getFont = async (num) => {
+    if (fontCache.has(num)) return fontCache.get(num);
+    const font = await loadPdfFont(objects, num, getStream);
+    fontCache.set(num, font);
+    return font;
+  };
+
+  const items = [];
+  const pages = findPdfPages(objects);
+  for (let pageIndex = 0; pageIndex < pages.length; pageIndex += 1) {
+    const page = pages[pageIndex];
+    const fontRefs = pageFontRefs(objects, page.dict);
+    const fonts = {};
+    for (const [name, ref] of Object.entries(fontRefs)) {
+      fonts[name] = await getFont(ref);
+    }
+    let content = "";
+    for (const ref of pageContentRefs(page.dict)) {
+      content += `${await getStream(ref)}\n`;
+    }
+    runContentStream(content, fonts, pageIndex, items);
+  }
+  return items;
+}
+
+function readPdfObjects(raw) {
+  const objects = new Map();
+  const objRegex = /(\d+)\s+\d+\s+obj\b/g;
+  let match;
+  while ((match = objRegex.exec(raw))) {
+    const num = Number(match[1]);
+    const bodyStart = match.index + match[0].length;
+    const endObj = raw.indexOf("endobj", bodyStart);
+    if (endObj === -1) break;
+    const body = raw.slice(bodyStart, endObj);
+    const streamMatch = body.match(/\bstream\r?\n/);
+    const obj = { num, dict: body };
+    if (streamMatch) {
+      obj.dict = body.slice(0, streamMatch.index);
+      obj.streamStart = bodyStart + streamMatch.index + streamMatch[0].length;
+      const endStream = raw.indexOf("endstream", obj.streamStart);
+      obj.streamEnd = endStream === -1 ? endObj : endStream;
+    }
+    objects.set(num, obj);
+    objRegex.lastIndex = endObj + 6;
+  }
+  return objects;
+}
+
+function findPdfPages(objects) {
+  const pageObjects = [...objects.values()].filter((obj) => /\/Type\s*\/Page\b/.test(obj.dict));
+  const pagesRoot = [...objects.values()].find((obj) => /\/Type\s*\/Pages\b/.test(obj.dict) && !/\/Parent\b/.test(obj.dict));
+  if (!pagesRoot) return pageObjects;
+
+  const ordered = [];
+  const visit = (obj, depth) => {
+    if (!obj || depth > 20) return;
+    if (/\/Type\s*\/Page\b/.test(obj.dict)) {
+      ordered.push(obj);
+      return;
+    }
+    const kids = obj.dict.match(/\/Kids\s*\[([^\]]*)\]/);
+    if (!kids) return;
+    [...kids[1].matchAll(/(\d+)\s+\d+\s+R/g)].forEach((ref) => visit(objects.get(Number(ref[1])), depth + 1));
+  };
+  visit(pagesRoot, 0);
+  return ordered.length ? ordered : pageObjects;
+}
+
+function pageContentRefs(pageDict) {
+  const match = pageDict.match(/\/Contents\s*(\[[^\]]*\]|\d+\s+\d+\s+R)/);
+  if (!match) return [];
+  return [...match[1].matchAll(/(\d+)\s+\d+\s+R/g)].map((ref) => Number(ref[1]));
+}
+
+function pageFontRefs(objects, pageDict) {
+  let resources = "";
+  const resourceRef = pageDict.match(/\/Resources\s+(\d+)\s+\d+\s+R/);
+  if (resourceRef) resources = objects.get(Number(resourceRef[1]))?.dict || "";
+  else resources = extractDictAfter(pageDict, "/Resources");
+
+  let fontDict = "";
+  const fontRef = resources.match(/\/Font\s+(\d+)\s+\d+\s+R/);
+  if (fontRef) fontDict = objects.get(Number(fontRef[1]))?.dict || "";
+  else fontDict = extractDictAfter(resources, "/Font");
+
+  const refs = {};
+  for (const ref of fontDict.matchAll(/\/([^\s/<>\[\]()]+)\s+(\d+)\s+\d+\s+R/g)) {
+    refs[ref[1]] = Number(ref[2]);
+  }
+  return refs;
+}
+
+function extractDictAfter(text, key) {
+  const keyIndex = text.indexOf(key);
+  if (keyIndex === -1) return "";
+  const start = text.indexOf("<<", keyIndex);
+  if (start === -1) return "";
+  let depth = 0;
+  for (let i = start; i < text.length - 1; i += 1) {
+    if (text[i] === "<" && text[i + 1] === "<") {
+      depth += 1;
+      i += 1;
+    } else if (text[i] === ">" && text[i + 1] === ">") {
+      depth -= 1;
+      i += 1;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return text.slice(start);
+}
+
+async function loadPdfFont(objects, num, getStream) {
+  const dict = objects.get(num)?.dict || "";
+  const isType0 = /\/Subtype\s*\/Type0/.test(dict);
+  const font = { bytesPerCode: isType0 ? 2 : 1, toUnicode: new Map(), widths: new Map(), defaultWidth: isType0 ? 1000 : 500 };
+
+  const toUnicodeRef = dict.match(/\/ToUnicode\s+(\d+)\s+\d+\s+R/);
+  if (toUnicodeRef) parseToUnicodeCMap(await getStream(Number(toUnicodeRef[1])), font.toUnicode);
+
+  if (isType0) {
+    let descendant = dict;
+    const descendantRef = dict.match(/\/DescendantFonts\s*\[\s*(\d+)\s+\d+\s+R/);
+    if (descendantRef) descendant = objects.get(Number(descendantRef[1]))?.dict || dict;
+    const dw = descendant.match(/\/DW\s+([\d.]+)/);
+    if (dw) font.defaultWidth = Number(dw[1]);
+    let widthText = "";
+    const widthRef = descendant.match(/\/W\s+(\d+)\s+\d+\s+R/);
+    if (widthRef) widthText = objects.get(Number(widthRef[1]))?.dict || "";
+    else widthText = extractBalancedArray(descendant, "/W");
+    parseCidWidths(widthText, font.widths);
+  } else {
+    const firstChar = Number((dict.match(/\/FirstChar\s+(\d+)/) || [])[1] || 0);
+    let widthText = "";
+    const widthRef = dict.match(/\/Widths\s+(\d+)\s+\d+\s+R/);
+    if (widthRef) widthText = objects.get(Number(widthRef[1]))?.dict || "";
+    else widthText = extractBalancedArray(dict, "/Widths");
+    (widthText.match(/-?[\d.]+/g) || []).forEach((value, index) => font.widths.set(firstChar + index, Number(value)));
+  }
+  return font;
+}
+
+function extractBalancedArray(text, key) {
+  const keyMatch = text.match(new RegExp(`${escapeRegex(key)}\\s*\\[`));
+  if (!keyMatch) return "";
+  const start = keyMatch.index + keyMatch[0].length - 1;
+  let depth = 0;
+  for (let i = start; i < text.length; i += 1) {
+    if (text[i] === "[") depth += 1;
+    else if (text[i] === "]") {
+      depth -= 1;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return text.slice(start);
+}
+
+function parseCidWidths(text, widths) {
+  const inner = text.trim().replace(/^\[/, "").replace(/\]$/, "");
+  const tokens = inner.match(/\[|\]|-?[\d.]+/g) || [];
+  let i = 0;
+  while (i < tokens.length) {
+    const first = Number(tokens[i]);
+    if (tokens[i + 1] === "[") {
+      let code = first;
+      i += 2;
+      while (i < tokens.length && tokens[i] !== "]") {
+        widths.set(code, Number(tokens[i]));
+        code += 1;
+        i += 1;
+      }
+      i += 1;
+    } else {
+      const last = Number(tokens[i + 1]);
+      const width = Number(tokens[i + 2]);
+      for (let code = first; code <= last; code += 1) widths.set(code, width);
+      i += 3;
+    }
+  }
+}
+
+function parseToUnicodeCMap(text, map) {
+  const hexToString = (hex) => {
+    let out = "";
+    for (let i = 0; i < hex.length; i += 4) out += String.fromCharCode(parseInt(hex.slice(i, i + 4).padEnd(4, "0"), 16));
+    return out;
+  };
+  for (const block of text.matchAll(/beginbfchar([\s\S]*?)endbfchar/g)) {
+    for (const pair of block[1].matchAll(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]*)>/g)) {
+      map.set(parseInt(pair[1], 16), hexToString(pair[2]));
+    }
+  }
+  for (const block of text.matchAll(/beginbfrange([\s\S]*?)endbfrange/g)) {
+    for (const range of block[1].matchAll(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*(<[0-9a-fA-F]+>|\[[^\]]*\])/g)) {
+      const low = parseInt(range[1], 16);
+      const high = parseInt(range[2], 16);
+      if (range[3].startsWith("[")) {
+        [...range[3].matchAll(/<([0-9a-fA-F]*)>/g)].forEach((value, index) => map.set(low + index, hexToString(value[1])));
+      } else {
+        const base = range[3].slice(1, -1);
+        const baseCode = parseInt(base, 16);
+        for (let code = low; code <= high; code += 1) {
+          map.set(code, String.fromCharCode(baseCode + (code - low)));
+        }
+      }
+    }
+  }
+}
+
+function tokenizeContentStream(content) {
+  const tokens = [];
+  const length = content.length;
+  let i = 0;
+  const isWhite = (ch) => ch === " " || ch === "\n" || ch === "\r" || ch === "\t" || ch === "\f" || ch === "\0";
+  const isDelim = (ch) => "()<>[]{}/%".includes(ch);
+
+  while (i < length) {
+    const ch = content[i];
+    if (isWhite(ch)) {
+      i += 1;
+    } else if (ch === "%") {
+      while (i < length && content[i] !== "\n" && content[i] !== "\r") i += 1;
+    } else if (ch === "(") {
+      let depth = 1;
+      let value = "";
+      i += 1;
+      while (i < length && depth > 0) {
+        const c = content[i];
+        if (c === "\\") {
+          const next = content[i + 1];
+          const escapes = { n: "\n", r: "\r", t: "\t", b: "\b", f: "\f" };
+          if (/[0-7]/.test(next)) {
+            const octal = content.slice(i + 1, i + 4).match(/^[0-7]{1,3}/)[0];
+            value += String.fromCharCode(parseInt(octal, 8));
+            i += 1 + octal.length;
+            continue;
+          }
+          value += escapes[next] ?? next;
+          i += 2;
+          continue;
+        }
+        if (c === "(") depth += 1;
+        if (c === ")") depth -= 1;
+        if (depth > 0) value += c;
+        i += 1;
+      }
+      tokens.push({ type: "string", value });
+    } else if (ch === "<" && content[i + 1] === "<") {
+      tokens.push({ type: "dictStart" });
+      i += 2;
+    } else if (ch === ">" && content[i + 1] === ">") {
+      tokens.push({ type: "dictEnd" });
+      i += 2;
+    } else if (ch === "<") {
+      const end = content.indexOf(">", i);
+      const hex = content.slice(i + 1, end === -1 ? length : end).replace(/\s+/g, "");
+      let value = "";
+      for (let h = 0; h < hex.length; h += 2) value += String.fromCharCode(parseInt(hex.slice(h, h + 2).padEnd(2, "0"), 16));
+      tokens.push({ type: "string", value });
+      i = end === -1 ? length : end + 1;
+    } else if (ch === "[") {
+      tokens.push({ type: "arrayStart" });
+      i += 1;
+    } else if (ch === "]") {
+      tokens.push({ type: "arrayEnd" });
+      i += 1;
+    } else if (ch === "/") {
+      let j = i + 1;
+      while (j < length && !isWhite(content[j]) && !isDelim(content[j])) j += 1;
+      tokens.push({ type: "name", value: content.slice(i + 1, j) });
+      i = j;
+    } else {
+      let j = i;
+      while (j < length && !isWhite(content[j]) && !isDelim(content[j])) j += 1;
+      if (j === i) j += 1;
+      const word = content.slice(i, j);
+      if (/^[+-]?(\d+\.?\d*|\.\d+)$/.test(word)) {
+        tokens.push({ type: "number", value: Number(word) });
+      } else if (word === "BI") {
+        const end = content.indexOf("EI", j);
+        j = end === -1 ? length : end + 2;
+      } else {
+        tokens.push({ type: "op", value: word });
+      }
+      i = j;
+    }
+  }
+  return tokens;
+}
+
+function runContentStream(content, fonts, pageIndex, items) {
+  const tokens = tokenizeContentStream(content);
+  const stack = [];
+  let arrayStack = null;
+  let order = 0;
+  const textState = { font: null, size: 1, charSpacing: 0, wordSpacing: 0, scale: 1, leading: 0 };
+  let tm = [1, 0, 0, 1, 0, 0];
+  let lm = [1, 0, 0, 1, 0, 0];
+
+  const setLine = (tx, ty) => {
+    lm = [lm[0], lm[1], lm[2], lm[3], lm[4] + tx * lm[0] + ty * lm[2], lm[5] + tx * lm[1] + ty * lm[3]];
+    tm = [...lm];
+  };
+
+  const showText = (parts) => {
+    const font = textState.font;
+    if (!font) return;
+    const size = textState.size;
+    const splitGap = size * 0.9;
+    const spaceGap = size * 0.2;
+    let advance = 0;
+    let current = "";
+    let currentStart = 0;
+    // Runs that were separated by a kerning gap rather than a space glyph. A spreadsheet cell that
+    // overflows into its neighbour can be printed in the same run as the next cell's text, so the
+    // parser may need to split the run at one of these positions.
+    let softBreaks = [];
+    let pendingSoftBreak = false;
+    const absX = (offset) => Math.round((tm[4] + offset * tm[0]) * 10) / 10;
+
+    const flush = () => {
+      const text = cleanText(current);
+      if (text) {
+        const item = {
+          x: absX(currentStart),
+          y: Math.round((tm[5] + currentStart * tm[1]) * 10) / 10,
+          text,
+          page: pageIndex,
+          order: order++,
+        };
+        if (softBreaks.length) item.softBreaks = softBreaks;
+        items.push(item);
+      }
+      current = "";
+      softBreaks = [];
+      pendingSoftBreak = false;
+    };
+
+    parts.forEach((part) => {
+      if (typeof part === "number") {
+        const gap = (-part / 1000) * size * textState.scale;
+        if (gap > splitGap) flush();
+        else if (gap > spaceGap && current.trim() && !current.endsWith(" ")) {
+          current += " ";
+          pendingSoftBreak = true;
+        }
+        advance += gap;
+        return;
+      }
+      for (let i = 0; i + font.bytesPerCode <= part.length; i += font.bytesPerCode) {
+        let code = 0;
+        for (let b = 0; b < font.bytesPerCode; b += 1) code = (code << 8) | part.charCodeAt(i + b);
+        const char = font.toUnicode.has(code) ? font.toUnicode.get(code) : String.fromCharCode(code);
+        if (!current.trim() && char.trim()) currentStart = advance;
+        if (pendingSoftBreak && char.trim()) {
+          softBreaks.push({ index: cleanText(current).length + 1, x: absX(advance) });
+          pendingSoftBreak = false;
+        } else if (!char.trim()) {
+          pendingSoftBreak = false;
+        }
+        current += char;
+        const width = font.widths.has(code) ? font.widths.get(code) : font.defaultWidth;
+        const spacing = textState.charSpacing + (char === " " ? textState.wordSpacing : 0);
+        advance += ((width / 1000) * size + spacing) * textState.scale;
+      }
+    });
+    flush();
+    tm = [tm[0], tm[1], tm[2], tm[3], tm[4] + advance * tm[0], tm[5] + advance * tm[1]];
+  };
+
+  for (const token of tokens) {
+    if (token.type === "arrayStart") {
+      arrayStack = [];
+      continue;
+    }
+    if (token.type === "arrayEnd") {
+      stack.push(arrayStack || []);
+      arrayStack = null;
+      continue;
+    }
+    if (arrayStack && (token.type === "number" || token.type === "string")) {
+      arrayStack.push(token.value);
+      continue;
+    }
+    if (token.type !== "op") {
+      stack.push(token.value);
+      continue;
+    }
+
+    const op = token.value;
+    const nums = (count) => stack.slice(-count).map(Number);
+    switch (op) {
+      case "BT":
+        tm = [1, 0, 0, 1, 0, 0];
+        lm = [1, 0, 0, 1, 0, 0];
+        break;
+      case "Tf": {
+        const [name, size] = stack.slice(-2);
+        textState.font = fonts[name] || null;
+        textState.size = Number(size) || 1;
+        break;
+      }
+      case "Tm":
+        lm = nums(6);
+        tm = [...lm];
+        break;
+      case "Td": {
+        const [tx, ty] = nums(2);
+        setLine(tx, ty);
+        break;
+      }
+      case "TD": {
+        const [tx, ty] = nums(2);
+        textState.leading = -ty;
+        setLine(tx, ty);
+        break;
+      }
+      case "T*":
+        setLine(0, -textState.leading);
+        break;
+      case "TL":
+        textState.leading = nums(1)[0];
+        break;
+      case "Tc":
+        textState.charSpacing = nums(1)[0];
+        break;
+      case "Tw":
+        textState.wordSpacing = nums(1)[0];
+        break;
+      case "Tz":
+        textState.scale = nums(1)[0] / 100;
+        break;
+      case "Tj":
+        showText([stack[stack.length - 1]]);
+        break;
+      case "'":
+        setLine(0, -textState.leading);
+        showText([stack[stack.length - 1]]);
+        break;
+      case '"': {
+        const [aw, ac] = stack.slice(-3, -1).map(Number);
+        textState.wordSpacing = aw;
+        textState.charSpacing = ac;
+        setLine(0, -textState.leading);
+        showText([stack[stack.length - 1]]);
+        break;
+      }
+      case "TJ":
+        showText(Array.isArray(stack[stack.length - 1]) ? stack[stack.length - 1] : []);
+        break;
+      default:
+        break;
+    }
+    stack.length = 0;
+  }
+}
+
+/* ---------- Timetable layout parser (Spring 2027+) ---------- */
+
+// Default left edges of each column, in the PDF's text-space units. When the header row is
+// found on a page, the detected header positions override these defaults.
+const TIMETABLE_COLUMNS = [
+  { key: "code", x: 0, header: /^Course Codes?/i },
+  { key: "crn", x: 135, header: /^CRN$/i },
+  { key: "title", x: 170, header: /^Course Title/i },
+  { key: "primary", x: 411, header: /^Primary Instructor/i },
+  { key: "secondary", x: 551, header: /^Secondary Instructor/i },
+  { key: "category", x: 656, header: /^Core\s*\/\s*Elective/i },
+  { key: "program", x: 752, header: /^Program/i },
+  { key: "level", x: 810, header: /^Level/i },
+  { key: "credits", x: 849, header: /^#?\s*of\s+Credits/i },
+  { key: "period", x: 900, header: /^Course Period/i },
+  { key: "students", x: 1015, header: /^(No\.? of|students)$/i },
+  { key: "capacity", x: 1065, header: /^(Course|Capacity)$/i },
+  { key: "days", x: 1121, header: /^Days?$/i },
+  { key: "time", x: 1154, header: /^Timings?$/i },
+  { key: "room", x: 1224, header: /^New Classroom/i },
+  { key: "oldRoom", x: 1321, header: /^Old Classroom/i },
+  { key: "notes", x: 1412, header: /^Notes?$/i },
+];
+const TIMETABLE_CODE_PATTERN = /^([A-Z]{2,6}\d{3,4}[A-Z]?)(?:-(lec|lab|lecture|tut|sem|rec)-?(\d{2,3})|-(\d{3}))?$/i;
+const HEADER_MARGIN = 8;
+const ROW_REACH = 22;
+
+function parseTimetableItems(items, fileName) {
+  const pages = new Map();
+  items.forEach((item) => {
+    if (!pages.has(item.page)) pages.set(item.page, []);
+    pages.get(item.page).push(item);
+  });
+
+  const term = termFromItems(items) || termFromFileName(fileName);
+  const meetings = [];
+  const seen = new Set();
+
+  [...pages.keys()].sort((a, b) => a - b).forEach((pageIndex) => {
+    const pageItems = pages.get(pageIndex);
+    const { columns, headerBottom } = timetableColumnsForPage(pageItems);
+    const crnX = columns.find((column) => column.key === "crn").x;
+    const body = pageItems
+      .filter((item) => item.y > headerBottom)
+      .flatMap((item) => splitItemAtColumns(item, columns));
+    const anchors = body
+      .filter((item) => item.x < crnX && TIMETABLE_CODE_PATTERN.test(item.text))
+      .sort((a, b) => a.y - b.y);
+    if (!anchors.length) return;
+
+    const rows = anchors.map((anchor) => ({ anchor, cells: {} }));
+    body.forEach((item) => {
+      if (anchors.includes(item)) return;
+      let best = null;
+      let bestDistance = Infinity;
+      rows.forEach((row) => {
+        const distance = Math.abs(row.anchor.y - item.y);
+        if (distance < bestDistance) {
+          best = row;
+          bestDistance = distance;
+        }
+      });
+      if (!best || bestDistance > ROW_REACH) return;
+      const column = columnForX(columns, item.x);
+      if (!column || column === "code") return;
+      (best.cells[column] ||= []).push(item);
+    });
+
+    rows.forEach((row) => {
+      const meeting = timetableRowToMeeting(row, term);
+      if (meeting && !seen.has(meeting.id)) {
+        seen.add(meeting.id);
+        meetings.push(meeting);
+      }
+    });
+  });
+
+  return meetings;
+}
+
+function timetableColumnsForPage(pageItems) {
+  const columns = TIMETABLE_COLUMNS.map((column) => ({ ...column }));
+  const headerItems = pageItems.filter((item) => /^(CRN|Course Title|Primary Instructor)$/i.test(item.text));
+  if (!headerItems.length) return { columns, headerBottom: -Infinity };
+
+  const headerY = headerItems[0].y;
+  // Header labels can share one text run ("#of Credits Course Period"); split them at every soft break.
+  const band = pageItems
+    .filter((item) => Math.abs(item.y - headerY) <= 12)
+    .flatMap((item) => splitItemAtColumns(item, item.softBreaks ? item.softBreaks.map((softBreak, index) => ({ key: index, x: softBreak.x })) : []));
+  columns.forEach((column) => {
+    const matches = band.filter((item) => column.header.test(item.text));
+    if (matches.length) column.x = Math.min(...matches.map((item) => item.x)) - HEADER_MARGIN;
+  });
+  columns[0].x = 0;
+  columns.sort((a, b) => a.x - b.x);
+  const headerBottom = Math.max(...band.map((item) => item.y)) + 2;
+  return { columns, headerBottom };
+}
+
+function splitItemAtColumns(item, columns) {
+  if (!item.softBreaks) return [item];
+  const pieces = [];
+  let start = 0;
+  let startX = item.x;
+  let startColumn = columnForX(columns, item.x);
+  item.softBreaks.forEach((softBreak) => {
+    const column = columnForX(columns, softBreak.x);
+    if (column === startColumn || softBreak.index <= start || softBreak.index >= item.text.length) return;
+    pieces.push({ ...item, x: startX, text: cleanText(item.text.slice(start, softBreak.index)), softBreaks: undefined });
+    start = softBreak.index;
+    startX = softBreak.x;
+    startColumn = column;
+  });
+  if (!pieces.length) return [item];
+  pieces.push({ ...item, x: startX, text: cleanText(item.text.slice(start)), softBreaks: undefined });
+  return pieces.filter((piece) => piece.text);
+}
+
+function columnForX(columns, x) {
+  let key = null;
+  for (const column of columns) {
+    if (x >= column.x) key = column.key;
+    else break;
+  }
+  return key;
+}
+
+function cellText(row, key) {
+  const cell = row.cells[key] || [];
+  return cleanText(
+    [...cell]
+      .sort((a, b) => a.y - b.y || a.x - b.x)
+      .map((item) => item.text)
+      .join(" ")
+  );
+}
+
+function timetableRowToMeeting(row, term) {
+  const codeMatch = row.anchor.text.match(TIMETABLE_CODE_PATTERN);
+  if (!codeMatch) return null;
+  const [, baseCode, typeToken, typeSection, plainSection] = codeMatch;
+  const section = (typeSection || plainSection || "001").padStart(3, "0");
+  const courseCode = `${baseCode.toUpperCase()}-${section}`;
+  const type = meetingTypeLabel(typeToken);
+
+  const crnMatch = cellText(row, "crn").match(/\d{4,6}/);
+  if (!crnMatch) return null;
+  const crn = crnMatch[0];
+
+  const daysText = cellText(row, "days").toUpperCase().replace(/\s+/g, "");
+  const timeMatch = cellText(row, "time").match(/(\d{1,2}:\d{2})\s*[-–—]\s*(\d{1,2}:\d{2})/);
+  const hasSchedule = /^[MTWRFUS]+$/.test(daysText) && timeMatch;
+  const days = hasSchedule ? daysText : "TBA";
+  const startTime = hasSchedule ? normalizeTime(timeMatch[1]) : "";
+  const endTime = hasSchedule ? normalizeTime(timeMatch[2]) : "";
+
+  const periodText = cellText(row, "period");
+  const dateRanges = [...periodText.matchAll(/\(([^)]*)\)/g)].map((match) => cleanText(match[1]));
+  const secondary = cellText(row, "secondary");
+  const creditsMatch = cellText(row, "credits").match(/-?\d+/);
+  const room = cellText(row, "room");
+  const oldRoom = cellText(row, "oldRoom");
+
+  return {
+    id: `${courseCode}|${crn}|${type}|${days}|${startTime}|${endTime}`,
+    term,
+    baseCode: baseCode.toUpperCase(),
+    courseCode,
+    type,
+    crn,
+    title: cellText(row, "title") || baseCode.toUpperCase(),
+    credits: creditsMatch ? Number(creditsMatch[0]) : 0,
+    days,
+    dayList: hasSchedule ? expandDays(days) : [],
+    startTime,
+    endTime,
+    startMinutes: hasSchedule ? minutesFromTime(startTime) : null,
+    endMinutes: hasSchedule ? minutesFromTime(endTime) : null,
+    instructor: cellText(row, "primary") || "TBA",
+    secondaryInstructor: secondary,
+    category: cellText(row, "category"),
+    program: cellText(row, "program") || "Unknown",
+    level: cellText(row, "level"),
+    period: normalizePeriod(periodText),
+    dateRange: dateRanges.join(" and "),
+    enrollment: cellText(row, "students"),
+    capacity: cellText(row, "capacity"),
+    room: room && room !== "N/A" ? room : "TBA",
+    oldRoom: oldRoom && oldRoom !== "N/A" ? oldRoom : "",
+    notes: cellText(row, "notes"),
+  };
+}
+
+function meetingTypeLabel(token) {
+  const value = String(token || "lec").toLowerCase();
+  if (value.startsWith("lab")) return "Lab";
+  if (value.startsWith("tut")) return "Tutorial";
+  if (value.startsWith("sem")) return "Seminar";
+  if (value.startsWith("rec")) return "Recitation";
+  return "Lecture";
+}
+
+function termFromItems(items) {
+  for (const item of items.slice(0, 40)) {
+    const match = item.text.match(/\b(Spring|Summer|Fall|Winter)\s+(\d{4})\b/i);
+    if (match) return `${match[1][0].toUpperCase()}${match[1].slice(1).toLowerCase()} ${match[2]}`;
+  }
+  return "";
+}
+
+/* ---------- Legacy layout extraction (Fall 2026) ---------- */
 
 async function extractPdfTextItems(arrayBuffer) {
   const bytes = new Uint8Array(arrayBuffer);
@@ -374,11 +1090,23 @@ function extractProgramFromEnd(text) {
 
 function parsePeriodParts(parts) {
   const text = cleanText(parts.join(" "));
-  const period = PERIODS.find((candidate) => text.includes(candidate)) || "Unknown";
+  const printedPeriod = PERIODS.find((candidate) => text.includes(candidate)) || "";
   const dateMatch = text.match(/\d{1,2}(?:st|nd|rd|th)?\s+\w+\s+-\s+\d{1,2}(?:st|nd|rd|th)?\s+\w+(?:\s+\d{4})?/);
   const dateRange = dateMatch ? dateMatch[0] : "";
-  const notes = cleanText(text.replace(period, "").replace(dateRange, ""));
-  return { period, dateRange, notes };
+  const notes = cleanText(text.replace(printedPeriod, "").replace(dateRange, ""));
+  return { period: normalizePeriod(printedPeriod), dateRange, notes };
+}
+
+function normalizePeriod(text) {
+  const value = String(text || "");
+  const first = /first\s*7[\s-]*weeks?|\(7-1\)/i.test(value);
+  const second = /second\s*7[\s-]*weeks?|\(7-2\)/i.test(value);
+  if (first && second) return PERIOD_BOTH_HALVES;
+  if (first) return PERIOD_FIRST;
+  if (second) return PERIOD_SECOND;
+  if (/14\s*weeks?/i.test(value)) return PERIOD_FULL;
+  if (/11\s*weeks?/i.test(value)) return PERIOD_ELEVEN;
+  return "Unknown";
 }
 
 function parseRightParts(parts) {
@@ -449,6 +1177,7 @@ function buildCourseIndex() {
         crn: meeting.crn,
         title: meeting.title,
         program: meeting.program,
+        level: meeting.level || "",
         credits: meeting.credits,
         meetings: [],
       });
@@ -465,6 +1194,7 @@ function buildCourseIndex() {
         baseCode: section.baseCode,
         title: section.title,
         program: section.program,
+        level: section.level,
         sections: [],
       });
     }
@@ -512,12 +1242,14 @@ function renderCatalog() {
   const level = els.levelFilter.value;
   const courses = state.courses.filter((course) => {
     const matchesProgram = program === "all" || course.program === program;
-    const matchesLevel = level === "all" || courseLevel(course) === level;
+    const matchesLevel = level === "all" || courseLevels(course).includes(level);
     const haystack = [
       course.baseCode,
       course.title,
       course.program,
-      ...course.sections.flatMap((section) => section.meetings.map((meeting) => meeting.instructor)),
+      ...course.sections.flatMap((section) =>
+        section.meetings.flatMap((meeting) => [meeting.instructor, meeting.secondaryInstructor || ""])
+      ),
     ]
       .join(" ")
       .toLowerCase();
@@ -1270,7 +2002,6 @@ function loadLastLoadedJson() {
     return false;
   }
   if (payload.parserVersion !== PARSER_VERSION) {
-    showStatus("Saved PDF data was parsed with an older parser. Please reload the PDF once.");
     return false;
   }
 
@@ -1356,8 +2087,8 @@ function getVisibleScheduleMeetings() {
 
 function meetingVisibleInPeriod(meeting, periodView) {
   if (periodView === "all") return true;
-  if (periodView === "first") return meeting.period !== "Second 7 Weeks (7-2)";
-  if (periodView === "second") return meeting.period !== "First 7 Weeks (7-1)";
+  if (periodView === "first") return meeting.period !== PERIOD_SECOND;
+  if (periodView === "second") return meeting.period !== PERIOD_FIRST;
   return true;
 }
 
@@ -1391,8 +2122,8 @@ function findConflicts(meetings) {
 function periodsOverlap(a, b) {
   if (a === "Unknown" || b === "Unknown") return true;
   if (a === b) return true;
-  if (a === "Second 7 Weeks (7-2)" && b === "First 7 Weeks (7-1)") return false;
-  if (a === "First 7 Weeks (7-1)" && b === "Second 7 Weeks (7-2)") return false;
+  if (a === PERIOD_SECOND && b === PERIOD_FIRST) return false;
+  if (a === PERIOD_FIRST && b === PERIOD_SECOND) return false;
   return true;
 }
 
@@ -1405,22 +2136,37 @@ function minTime(a, b) {
 }
 
 function formatMeetingBrief(meeting) {
-  return `${escapeHtml(meeting.type)} ${escapeHtml(meeting.days)} ${escapeHtml(meeting.startTime)}-${escapeHtml(meeting.endTime)} · ${escapeHtml(meeting.period)} · ${escapeHtml(meeting.room)}`;
+  const when = meeting.startTime
+    ? `${escapeHtml(meeting.days)} ${escapeHtml(meeting.startTime)}-${escapeHtml(meeting.endTime)}`
+    : "time TBA";
+  const room = meeting.oldRoom && meeting.oldRoom !== meeting.room
+    ? `${escapeHtml(meeting.room)} (old ${escapeHtml(meeting.oldRoom)})`
+    : escapeHtml(meeting.room);
+  return `${escapeHtml(meeting.type)} ${when} · ${escapeHtml(meeting.period)} · ${room}`;
 }
 
-function courseLevel(course) {
-  if (course.program === "All PhD") return "phd";
+function courseLevels(course) {
+  // Newer PDFs print a Level column (MSc, PhD, MS/PhD); older ones only imply it by course number.
+  const printed = String(course.level || "").toLowerCase();
+  if (printed) {
+    const levels = [];
+    if (/\bms|msc|master/.test(printed)) levels.push("masters");
+    if (/phd/.test(printed)) levels.push("phd");
+    if (levels.length) return levels;
+  }
+  if (course.program === "All PhD") return ["phd"];
   const match = course.baseCode.match(/^[A-Z]+(\d)/);
-  if (!match) return "other";
-  if (match[1] === "7") return "masters";
-  if (match[1] === "8") return "phd";
-  return "other";
+  if (!match) return ["other"];
+  if (match[1] === "7") return ["masters"];
+  if (match[1] === "8") return ["phd"];
+  return ["other"];
 }
 
 function courseLevelLabel(course) {
-  const level = courseLevel(course);
-  if (level === "masters") return "Master's level";
-  if (level === "phd") return "PhD level";
+  const levels = courseLevels(course);
+  if (levels.includes("masters") && levels.includes("phd")) return "Master's / PhD level";
+  if (levels.includes("masters")) return "Master's level";
+  if (levels.includes("phd")) return "PhD level";
   return "Other level";
 }
 
@@ -1457,6 +2203,19 @@ function programClass(program) {
   return slug ? `program-${slug}` : "program-unknown";
 }
 
-if (!loadLastLoadedJson()) {
+function loadBundledSchedule() {
+  // data/<term>.js ships the current semester pre-parsed so the site works without uploading a PDF.
+  const bundled = window.BUNDLED_SCHEDULE;
+  if (!bundled || !Array.isArray(bundled.meetings) || !bundled.meetings.length) return false;
+
+  state.term = bundled.term || "Bundled Term";
+  state.meetings = bundled.meetings;
+  buildCourseIndex();
+  renderAll();
+  showStatus(`Loaded ${state.term} schedule (${bundled.sourceFile || "bundled data"}).`);
+  return true;
+}
+
+if (!loadLastLoadedJson() && !loadBundledSchedule()) {
   renderSchedule();
 }
